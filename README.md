@@ -22,11 +22,11 @@ curl -X POST 'http://localhost:4445/clients' \
   "response_types": ["code", "id_token"],
   "scope": "openid offline",
   "token_endpoint_auth_method": "client_secret_post",
-  "metadata": {"registration": true}
+  "metadata": {"registration": true, "consent": true}
 }'
 ```
 
-Note: You can turn off registration by setting the `registration` property to `false` in the `metadata` property above.
+Note: You can turn off registration/consent by setting the `registration`/`consent` property to `false` in the `metadata` property above.
 
 - Open [localhost:4455/login](http://localhost:4455) in your browser.
 

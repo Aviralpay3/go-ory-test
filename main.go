@@ -53,6 +53,7 @@ type idpConfig struct {
 }
 
 type Metadata struct {
+	Consent      bool `json:"consent"`
 	Registration bool `json:"registration"`
 	Verification bool `json:"verification"`
 }
@@ -129,7 +130,7 @@ func main() {
 					"response_types": ["code", "id_token"],
 					"scope": "openid offline",
 					"token_endpoint_auth_method": "client_secret_post",
-					"metadata": {"registration": true}
+					"metadata": {"registration": true, "consent": true}
 			}'
 		(or)
 		run the compiled binary setting the "-withoauthclient" flag to true to
@@ -253,10 +254,18 @@ func (s *server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// store metadata value in session
-	v := getSessionValue(w, r, "canRegister")
-	reg, ok := v.(bool)
-	if ok {
-		metadata.Registration = reg
+	c := getSessionValue(w, r, "showConsent")
+	consent, consentOK := c.(bool)
+	if consentOK {
+		metadata.Consent = consent
+	} else {
+		setSessionValue(w, r, "showConsent", metadata.Consent)
+	}
+
+	reg := getSessionValue(w, r, "canRegister")
+	register, registerOK := reg.(bool)
+	if registerOK {
+		metadata.Registration = register
 	} else {
 		setSessionValue(w, r, "canRegister", metadata.Registration)
 	}
@@ -589,25 +598,130 @@ func (s *server) handleHydraConsent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// accept consent request and add verifiable address to id_token in session
-	acceptConsentRes, _, err := s.HydraAPIClient.AdminApi.AcceptConsentRequest(r.Context()).
-		ConsentChallenge(challenge).
-		AcceptConsentRequest(hydra.AcceptConsentRequest{
-			GrantScope:  getConsentRes.RequestedScope,
-			Remember:    pointer.ToBool(true),
-			RememberFor: pointer.ToInt64(3600),
-			Session: &hydra.ConsentRequestSession{
-				IdToken: service.PersonSchemaJsonTraits{Email: session.Identity.VerifiableAddresses[0].Value},
-			},
-		}).Execute()
-
-	if err != nil {
-		log.Error(err)
-		writeError(w, http.StatusUnauthorized, errors.New("Unauthorized OAuth Client"))
-		return
+	// if user has submitted consent form, process it and get granted scopes
+	var grantedScopes []string
+	var submittedConsentForm bool
+	if r.Method == http.MethodPost {
+		if err := r.ParseForm(); err != nil {
+			log.Error(err)
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		for key, values := range r.PostForm {
+			if key == "scopes" {
+				for _, value := range values {
+					grantedScopes = append(grantedScopes, value)
+				}
+			}
+		}
+		submittedConsentForm = true
 	}
 
-	http.Redirect(w, r, acceptConsentRes.RedirectTo, http.StatusFound)
+	// check metadata value in session
+	v := getSessionValue(w, r, "showConsent")
+	showConsent, ok := v.(bool)
+
+	switch {
+	// show the consent form only if user has not already granted scopes and consent form metadata is true
+	case ok && showConsent && !submittedConsentForm && len(grantedScopes) == 0:
+		var consentUiNodes []kratos.UiNode
+		for _, requestedScope := range getConsentRes.RequestedScope {
+			consentUiNodes = append(consentUiNodes, kratos.UiNode{
+				Attributes: kratos.UiNodeAttributes{
+					UiNodeInputAttributes: &kratos.UiNodeInputAttributes{
+						NodeType: "input",
+						Name:     "scopes",
+						Type:     "checkbox",
+						Value:    requestedScope,
+					},
+				},
+				Meta: kratos.UiNodeMeta{
+					Label: &kratos.UiText{
+						Text: requestedScope,
+					},
+				},
+				Type: "input",
+			})
+		}
+		consentUiNodes = append(consentUiNodes, kratos.UiNode{
+			Attributes: kratos.UiNodeAttributes{
+				UiNodeInputAttributes: &kratos.UiNodeInputAttributes{
+					Name:     "method",
+					NodeType: "input",
+					Type:     "submit",
+				},
+			},
+			Meta: kratos.UiNodeMeta{
+				Label: &kratos.UiText{
+					Text: "Submit",
+				},
+			},
+			Type: "input",
+		})
+
+		consentUI := &kratos.UiContainer{
+			Action: fmt.Sprintf("/auth/consent?consent_challenge=%s", getConsentRes.Challenge),
+			Method: http.MethodPost,
+			Messages: []kratos.UiText{
+				{
+					Text: "Please confirm that you want to grant access to the following scopes:",
+					Type: "info",
+				},
+			},
+			Nodes: consentUiNodes,
+		}
+		// render template index.html
+		templateData := templateData{
+			Title: "Consent",
+			UI:    consentUI,
+		}
+		templateData.Render(w)
+		return
+
+	// reject the consent request if user has not granted scopes
+	case ok && showConsent && submittedConsentForm && len(grantedScopes) == 0:
+		rejectConsentRes, _, err := s.HydraAPIClient.AdminApi.RejectConsentRequest(r.Context()).
+			ConsentChallenge(challenge).
+			RejectRequest(hydra.RejectRequest{
+				Error:            pointer.ToString("access denied"),
+				ErrorDescription: pointer.ToString("You must grant access to atleast one scope to continue"),
+				StatusCode:       pointer.ToInt64(http.StatusForbidden),
+			}).Execute()
+
+		if err != nil {
+			log.Error(err)
+			writeError(w, http.StatusUnauthorized, errors.New("Unauthorized OAuth Client"))
+			return
+		}
+
+		http.Redirect(w, r, rejectConsentRes.RedirectTo, http.StatusFound)
+	// accept consent request and add verifiable address to id_token in session
+	// only if the user has granted scopes or if consent metadata is set to false
+	default:
+		// grantedScopes will be empty if consent form metadata is set to false
+		// so store requested scopes from getConsentRes in grantedScopes
+		if len(grantedScopes) == 0 {
+			grantedScopes = append(grantedScopes, getConsentRes.RequestedScope...)
+		}
+		acceptConsentRes, _, err := s.HydraAPIClient.AdminApi.AcceptConsentRequest(r.Context()).
+			ConsentChallenge(challenge).
+			AcceptConsentRequest(hydra.AcceptConsentRequest{
+				GrantScope:  grantedScopes,
+				Remember:    pointer.ToBool(true),
+				RememberFor: pointer.ToInt64(3600),
+				Session: &hydra.ConsentRequestSession{
+					IdToken: service.PersonSchemaJsonTraits{Email: session.Identity.VerifiableAddresses[0].Value},
+				},
+			}).Execute()
+
+		if err != nil {
+			log.Error(err)
+			writeError(w, http.StatusUnauthorized, errors.New("Unauthorized OAuth Client"))
+			return
+		}
+
+		http.Redirect(w, r, acceptConsentRes.RedirectTo, http.StatusFound)
+	}
 }
 
 func NewServer(kratosPublicEndpointPort, hydraPublicEndpointPort, hydraAdminEndpointPort int) (*server, error) {
