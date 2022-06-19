@@ -17,12 +17,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/AlekSi/pointer"
 	"github.com/atreya2011/kratos-test/generated/go/service"
-	"github.com/go-openapi/strfmt"
 	"github.com/gorilla/sessions"
-	hydra "github.com/ory/hydra-client-go/client"
-	hydra_admin "github.com/ory/hydra-client-go/client/admin"
-	hydra_models "github.com/ory/hydra-client-go/models"
+	hydra "github.com/ory/hydra-client-go"
 	kratos "github.com/ory/kratos-client-go"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/oauth2"
@@ -48,10 +46,10 @@ type templateData struct {
 }
 
 type idpConfig struct {
-	ClientID       string `yaml:"client_id"`
-	ClientSecret   string `yaml:"client_secret"`
-	ClientMetadata string `yaml:"client_metadata"`
-	Port           int    `yaml:"port"`
+	ClientID       string                 `yaml:"client_id"`
+	ClientSecret   string                 `yaml:"client_secret"`
+	ClientMetadata map[string]interface{} `yaml:"client_metadata"`
+	Port           int                    `yaml:"port"`
 }
 
 type Metadata struct {
@@ -63,7 +61,7 @@ type Metadata struct {
 type server struct {
 	KratosAPIClient      *kratos.APIClient
 	KratosPublicEndpoint string
-	HydraAPIClient       *hydra.OryHydra
+	HydraAPIClient       *hydra.APIClient
 	Port                 string
 	OAuth2Config         *oauth2.Config
 	IDPConfig            *idpConfig
@@ -124,7 +122,7 @@ func main() {
 					"response_types": ["code", "id_token"],
 					"scope": "openid offline",
 					"token_endpoint_auth_method": "client_secret_post",
-					"metadata": "{\"registration\": true}"
+					"metadata": {"registration": true}
 			}'
 		(or)
 		run the compiled binary setting the "-withoauthclient" flag to true to
@@ -136,26 +134,21 @@ func main() {
 	flag.Parse()
 
 	if *withOAuthClient {
-		_, err = s.HydraAPIClient.Admin.GetOAuth2Client(&hydra_admin.GetOAuth2ClientParams{
-			Context: ctx,
-			ID:      s.IDPConfig.ClientID,
-		})
+		_, _, err = s.HydraAPIClient.AdminApi.GetOAuth2Client(ctx, s.IDPConfig.ClientID).Execute()
+
 		if err != nil {
-			_, err = s.HydraAPIClient.Admin.CreateOAuth2Client(
-				&hydra_admin.CreateOAuth2ClientParams{
-					Context: ctx,
-					Body: &hydra_models.OAuth2Client{
-						ClientID:                s.IDPConfig.ClientID,
-						ClientName:              "Test OAuth2 Client",
-						ClientSecret:            s.IDPConfig.ClientSecret,
-						GrantTypes:              []string{"authorization_code", "refresh_token"},
-						RedirectUris:            []string{fmt.Sprintf("http://localhost%s/dashboard", s.Port)},
-						ResponseTypes:           []string{"code", "id_token"},
-						Scope:                   "openid offline",
-						TokenEndpointAuthMethod: "client_secret_post",
-						Metadata:                s.IDPConfig.ClientMetadata,
-					},
-				})
+			_, _, err = s.HydraAPIClient.AdminApi.CreateOAuth2Client(ctx).
+				OAuth2Client(hydra.OAuth2Client{
+					ClientId:                pointer.ToString(s.IDPConfig.ClientID),
+					ClientName:              pointer.ToString("Test OAuth2 Client"),
+					ClientSecret:            pointer.ToString(s.IDPConfig.ClientSecret),
+					GrantTypes:              []string{"authorization_code", "refresh_token"},
+					RedirectUris:            []string{fmt.Sprintf("http://localhost%s/dashboard", s.Port)},
+					ResponseTypes:           []string{"code", "id_token"},
+					Scope:                   pointer.ToString("openid offline"),
+					TokenEndpointAuthMethod: pointer.ToString("client_secret_post"),
+					Metadata:                s.IDPConfig.ClientMetadata,
+				}).Execute()
 			if err != nil {
 				log.Fatalln("unable to create OAuth2 client: ", err)
 			}
@@ -219,36 +212,34 @@ func (s *server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	// get login request from hydra only if there is no flow id in the url query parameters
 	if flowID == "" {
-		loginRes, err := s.HydraAPIClient.Admin.GetLoginRequest(&hydra_admin.GetLoginRequestParams{
-			Context:        r.Context(),
-			LoginChallenge: challenge,
-		})
+		loginRes, _, err := s.HydraAPIClient.AdminApi.GetLoginRequest(r.Context()).LoginChallenge(challenge).Execute()
 		if err != nil {
-			log.Println(err)
+			log.Error(err)
 			writeError(w, http.StatusUnauthorized, errors.New("Unauthorized OAuth Client"))
 			return
 		}
-		log.Println("got client id: ", loginRes.Payload.Client.ClientID)
+		log.Println("got client id: ", loginRes.Client.ClientId)
 		// get client details from hydra
-		clientRes, err := s.HydraAPIClient.Admin.GetOAuth2Client(&hydra_admin.GetOAuth2ClientParams{
-			Context: r.Context(),
-			ID:      loginRes.Payload.Client.ClientID,
-		})
+		clientRes, _, err := s.HydraAPIClient.AdminApi.GetOAuth2Client(r.Context(), *loginRes.Client.ClientId).Execute()
 		if err != nil {
-			log.Println(err)
+			log.Error(err)
 			writeError(w, http.StatusUnauthorized, errors.New("Unauthorized OAuth Client"))
 			return
 		}
 
-		log.Println("got client metadata: ", clientRes.Payload.Metadata)
-		// unmarshal client metadata
-		md, ok := clientRes.Payload.Metadata.(string)
-		if !ok {
-			writeError(w, http.StatusInternalServerError, errors.New("Internal Server Error"))
+		log.Println("got client metadata: ", clientRes.Metadata)
+
+		// convert map to json string
+		md, err := json.Marshal(clientRes.Metadata)
+		if err != nil {
+			log.Error(err)
+			writeError(w, http.StatusInternalServerError, errors.New("Unable to marshal metadata"))
 			return
 		}
+
+		// convert json string to struct
 		if err = json.Unmarshal([]byte(md), &metadata); err != nil {
-			log.Println(err)
+			log.Error(err)
 			writeError(w, http.StatusInternalServerError, errors.New("Internal Server Error"))
 			return
 		}
@@ -322,22 +313,20 @@ func (s *server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	subject := string(traitsJSON)
 
 	// accept hydra login request
-	res, err := s.HydraAPIClient.Admin.AcceptLoginRequest(&hydra_admin.AcceptLoginRequestParams{
-		Context:        r.Context(),
-		LoginChallenge: challenge,
-		Body: &hydra_models.AcceptLoginRequest{
-			Remember:    true,
-			RememberFor: 3600,
-			Subject:     &subject,
-		},
-	})
+	res, _, err := s.HydraAPIClient.AdminApi.AcceptLoginRequest(r.Context()).
+		LoginChallenge(challenge).
+		AcceptLoginRequest(hydra.AcceptLoginRequest{
+			Remember:    pointer.ToBool(true),
+			RememberFor: pointer.ToInt64(3600),
+			Subject:     subject,
+		}).Execute()
 	if err != nil {
-		log.Println(err)
+		log.Error(err)
 		writeError(w, http.StatusUnauthorized, errors.New("Unauthorized OAuth Client"))
 		return
 	}
 
-	http.Redirect(w, r, *res.GetPayload().RedirectTo, http.StatusFound)
+	http.Redirect(w, r, res.RedirectTo, http.StatusFound)
 }
 
 // handleLogout handles kratos logout flow
@@ -545,12 +534,9 @@ func (s *server) handleHydraConsent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// get consent request
-	getConsentRes, err := s.HydraAPIClient.Admin.GetConsentRequest(&hydra_admin.GetConsentRequestParams{
-		Context:          r.Context(),
-		ConsentChallenge: challenge,
-	})
+	getConsentRes, _, err := s.HydraAPIClient.AdminApi.GetConsentRequest(r.Context()).ConsentChallenge(challenge).Execute()
 	if err != nil {
-		log.Println(err)
+		log.Error(err)
 		writeError(w, http.StatusUnauthorized, errors.New("Unauthorized OAuth Client"))
 		return
 	}
@@ -560,32 +546,30 @@ func (s *server) handleHydraConsent(w http.ResponseWriter, r *http.Request) {
 	// get session details
 	session, _, err := s.KratosAPIClient.V0alpha2Api.ToSession(r.Context()).Cookie(cookie).Execute()
 	if err != nil {
-		log.Println(err)
+		log.Error(err)
 		writeError(w, http.StatusUnauthorized, errors.New("Unauthorized OAuth Client"))
 		return
 	}
 
 	// accept consent request and add verifiable address to id_token in session
-	acceptConsentRes, err := s.HydraAPIClient.Admin.AcceptConsentRequest(&hydra_admin.AcceptConsentRequestParams{
-		Context:          r.Context(),
-		ConsentChallenge: challenge,
-		Body: &hydra_models.AcceptConsentRequest{
-			GrantScope:  getConsentRes.Payload.RequestedScope,
-			Remember:    true,
-			RememberFor: 3600,
-			Session: &hydra_models.ConsentRequestSession{
-				IDToken: service.PersonSchemaJsonTraits{Email: session.Identity.VerifiableAddresses[0].Value},
+	acceptConsentRes, _, err := s.HydraAPIClient.AdminApi.AcceptConsentRequest(r.Context()).
+		ConsentChallenge(challenge).
+		AcceptConsentRequest(hydra.AcceptConsentRequest{
+			GrantScope:  getConsentRes.RequestedScope,
+			Remember:    pointer.ToBool(true),
+			RememberFor: pointer.ToInt64(3600),
+			Session: &hydra.ConsentRequestSession{
+				IdToken: service.PersonSchemaJsonTraits{Email: session.Identity.VerifiableAddresses[0].Value},
 			},
-		},
-	})
+		}).Execute()
 
 	if err != nil {
-		log.Println(err)
+		log.Error(err)
 		writeError(w, http.StatusUnauthorized, errors.New("Unauthorized OAuth Client"))
 		return
 	}
 
-	http.Redirect(w, r, *acceptConsentRes.GetPayload().RedirectTo, http.StatusFound)
+	http.Redirect(w, r, acceptConsentRes.RedirectTo, http.StatusFound)
 }
 
 func NewServer(kratosPublicEndpointPort, hydraPublicEndpointPort, hydraAdminEndpointPort int) (*server, error) {
@@ -597,6 +581,9 @@ func NewServer(kratosPublicEndpointPort, hydraPublicEndpointPort, hydraAdminEndp
 		return nil, err
 	}
 	conf.HTTPClient = &http.Client{Jar: cj}
+
+	hydraConf := hydra.NewConfiguration()
+	hydraConf.Servers = hydra.ServerConfigurations{{URL: fmt.Sprintf("http://hydra:%d", hydraAdminEndpointPort)}}
 
 	idpConf := idpConfig{}
 
@@ -620,14 +607,10 @@ func NewServer(kratosPublicEndpointPort, hydraPublicEndpointPort, hydraAdminEndp
 	return &server{
 		KratosAPIClient:      kratos.NewAPIClient(conf),
 		KratosPublicEndpoint: fmt.Sprintf("http://localhost:%d", kratosPublicEndpointPort),
-		HydraAPIClient: hydra.NewHTTPClientWithConfig(strfmt.Default, &hydra.TransportConfig{
-			BasePath: "/",
-			Host:     fmt.Sprintf("hydra:%d", hydraAdminEndpointPort),
-			Schemes:  []string{"http"},
-		}),
-		Port:         fmt.Sprintf(":%d", idpConf.Port),
-		OAuth2Config: oauth2Conf,
-		IDPConfig:    &idpConf,
+		HydraAPIClient:       hydra.NewAPIClient(hydraConf),
+		Port:                 fmt.Sprintf(":%d", idpConf.Port),
+		OAuth2Config:         oauth2Conf,
+		IDPConfig:            &idpConf,
 	}, nil
 }
 
