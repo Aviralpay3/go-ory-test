@@ -29,6 +29,8 @@ import (
 
 var store = sessions.NewCookieStore([]byte("secret-key"))
 
+var publicHostname = "ec2-13-126-102-157.ap-south-1.compute.amazonaws.com"
+
 var appSession *sessions.Session
 
 //go:embed templates
@@ -151,7 +153,7 @@ func main() {
 					ClientName:              pointer.ToString("Test OAuth2 Client"),
 					ClientSecret:            pointer.ToString(s.IDPConfig.ClientSecret),
 					GrantTypes:              []string{"authorization_code", "refresh_token"},
-					RedirectUris:            []string{fmt.Sprintf("http://localhost%s/dashboard", s.Port)},
+					RedirectUris:            []string{fmt.Sprintf("http://%s%s/dashboard", publicHostname, s.Port)},
 					ResponseTypes:           []string{"code", "id_token"},
 					Scope:                   pointer.ToString("openid offline"),
 					TokenEndpointAuthMethod: pointer.ToString("client_secret_post"),
@@ -360,7 +362,7 @@ func (s *server) handleLogout(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				idToken = ""
 			}
-			http.Redirect(w, r, fmt.Sprintf("http://localhost:4444/oauth2/sessions/logout?id_token_hint=%s", idToken), http.StatusSeeOther)
+			http.Redirect(w, r, fmt.Sprintf("http://%s:4444/oauth2/sessions/logout?id_token_hint=%s", publicHostname, idToken), http.StatusSeeOther)
 			return
 		} else {
 			getLogoutRequestRes, _, err := s.HydraAPIClient.AdminApi.GetLogoutRequest(r.Context()).
@@ -727,7 +729,7 @@ func (s *server) handleHydraConsent(w http.ResponseWriter, r *http.Request) {
 func NewServer(kratosPublicEndpointPort, hydraPublicEndpointPort, hydraAdminEndpointPort int) (*server, error) {
 	// create a new kratos client for self hosted server
 	conf := kratos.NewConfiguration()
-	conf.Servers = kratos.ServerConfigurations{{URL: fmt.Sprintf("http://kratos:%d", kratosPublicEndpointPort)}}
+	conf.Servers = kratos.ServerConfigurations{{URL: fmt.Sprintf("http://%s:%d", publicHostname, kratosPublicEndpointPort)}}
 	cj, err := cookiejar.New(nil)
 	if err != nil {
 		return nil, err
@@ -735,7 +737,7 @@ func NewServer(kratosPublicEndpointPort, hydraPublicEndpointPort, hydraAdminEndp
 	conf.HTTPClient = &http.Client{Jar: cj}
 
 	hydraConf := hydra.NewConfiguration()
-	hydraConf.Servers = hydra.ServerConfigurations{{URL: fmt.Sprintf("http://hydra:%d", hydraAdminEndpointPort)}}
+	hydraConf.Servers = hydra.ServerConfigurations{{URL: fmt.Sprintf("http://%s:%d", publicHostname, hydraAdminEndpointPort)}}
 
 	idpConf := idpConfig{}
 
@@ -746,10 +748,10 @@ func NewServer(kratosPublicEndpointPort, hydraPublicEndpointPort, hydraAdminEndp
 	oauth2Conf := &oauth2.Config{
 		ClientID:     idpConf.ClientID,
 		ClientSecret: idpConf.ClientSecret,
-		RedirectURL:  fmt.Sprintf("http://localhost:%d/dashboard", idpConf.Port),
+		RedirectURL:  fmt.Sprintf("http://%s:%d/dashboard", publicHostname, idpConf.Port),
 		Endpoint: oauth2.Endpoint{
-			AuthURL:  fmt.Sprintf("http://localhost:%d/oauth2/auth", hydraPublicEndpointPort), // access from browser
-			TokenURL: fmt.Sprintf("http://hydra:%d/oauth2/token", hydraPublicEndpointPort),    // access from server
+			AuthURL:  fmt.Sprintf("http://%s:%d/oauth2/auth", publicHostname, hydraPublicEndpointPort), // access from browser
+			TokenURL: fmt.Sprintf("http://%s:%d/oauth2/token", publicHostname, hydraPublicEndpointPort),    // access from server
 		},
 		Scopes: []string{"openid", "offline"},
 	}
@@ -758,7 +760,7 @@ func NewServer(kratosPublicEndpointPort, hydraPublicEndpointPort, hydraAdminEndp
 
 	return &server{
 		KratosAPIClient:      kratos.NewAPIClient(conf),
-		KratosPublicEndpoint: fmt.Sprintf("http://localhost:%d", kratosPublicEndpointPort),
+		KratosPublicEndpoint: fmt.Sprintf("http://%s:%d", publicHostname, kratosPublicEndpointPort),
 		HydraAPIClient:       hydra.NewAPIClient(hydraConf),
 		Port:                 fmt.Sprintf(":%d", idpConf.Port),
 		OAuth2Config:         oauth2Conf,
